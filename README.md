@@ -1,4 +1,4 @@
-# Sistemas Embarcados — UPE
+# Sistemas Embarcados - UPE
 
 Repositório com os projetos práticos desenvolvidos na disciplina de **Sistemas Embarcados**, do curso de Engenharia da computação da **Universidade de Pernambuco (UPE)**.
 
