@@ -7,3 +7,7 @@ Disciplina de **Sistemas Embarcados** — Universidade de Pernambuco (UPE)
 ## Objetivo
 
 Desenvolver um sistema, utilizando a placa NUCLEO-L476RG e o periférico **EXTI** (*External Interrupt*), em que um LED pisque com frequência variável, controlada pelo botão de usuário (botão azul).
+
+## Resultado
+
+O LED inicia piscando a 1 Hz. A cada acionamento do botão azul, a cadência alterna corretamente entre 1 Hz e 2 Hz, conforme especificado, através da interrupção EXTI associada ao pino PC13.
