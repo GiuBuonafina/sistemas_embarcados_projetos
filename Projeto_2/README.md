@@ -11,3 +11,10 @@ Desenvolver um sistema, utilizando a placa NUCLEO-L476RG e o periférico **EXTI*
 ## Resultado
 
 O LED inicia piscando a 1 Hz. A cada acionamento do botão azul, a cadência alterna corretamente entre 1 Hz e 2 Hz, conforme especificado, através da interrupção EXTI associada ao pino PC13.
+
+## Vídeo
+
+
+
+https://github.com/user-attachments/assets/f3388037-8d4e-4973-a2c4-334985e0aad7
+
