@@ -1,0 +1,16 @@
+../Core/Src/main.c:105:5:main	4
+../Core/Src/main.c:160:6:SystemClock_Config	4
+../Core/Src/main.c:210:13:MX_I2C1_Init	4
+../Core/Src/main.c:258:13:MX_USART2_UART_Init	2
+../Core/Src/main.c:293:13:MX_GPIO_Init	1
+../Core/Src/main.c:330:13:uart_print	1
+../Core/Src/main.c:336:13:formata_volts	1
+../Core/Src/main.c:344:13:iniciar_leitura	3
+../Core/Src/main.c:355:13:iniciar_dac	2
+../Core/Src/main.c:369:13:processar_comando	15
+../Core/Src/main.c:399:13:tratar_evento_i2c	6
+../Core/Src/main.c:439:6:HAL_I2C_MasterTxCpltCallback	4
+../Core/Src/main.c:451:6:HAL_I2C_MasterRxCpltCallback	3
+../Core/Src/main.c:459:6:HAL_I2C_ErrorCallback	2
+../Core/Src/main.c:467:6:HAL_UART_RxCpltCallback	6
+../Core/Src/main.c:489:6:Error_Handler	1

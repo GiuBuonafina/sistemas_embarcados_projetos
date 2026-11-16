@@ -1,0 +1,10 @@
+20:33:54 **** Incremental Build of configuration Debug for project projeto 4 ****
+make -j16 all 
+arm-none-eabi-size  projeto\ 4.elf 
+   text	   data	    bss	    dec	    hex	filename
+  29216	     92	   2212	  31520	   7b20	projeto 4.elf
+Finished building: default.size.stdout
+ 
+
+20:33:54 Build Finished. 0 errors, 0 warnings. (took 248ms)
+

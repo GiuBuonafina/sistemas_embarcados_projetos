@@ -1,0 +1,514 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define PCF8591_ADDR   (0x48 << 1)   /* endereço 0x48 deslocado 1 bit (o HAL usa 0x90) */
+#define CTRL_DAC_ON    0x40          /* bit 6 do byte de controle: liga a saída analógica */
+#define TAM_LINHA      32            /* tamanho máximo de um comando digitado */
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+typedef enum {
+  I2C_LIVRE,            /* nenhuma operação I2C em andamento */
+  I2C_ENVIANDO_CANAL,   /* enviando o byte de controle (escolha do canal) */
+  I2C_LENDO,            /* lendo o resultado da conversão */
+  I2C_ENVIANDO_DAC      /* enviando controle + valor do DAC */
+} EstadoI2C;
+
+typedef enum {
+  EV_NENHUM,
+  EV_CANAL_ENVIADO,     /* o byte de controle foi enviado */
+  EV_LEITURA_OK,        /* os 2 bytes chegaram */
+  EV_DAC_OK,            /* o valor do DAC foi enviado */
+  EV_ERRO               /* o I2C falhou (sem resposta, etc.) */
+} EventoI2C;
+
+volatile EstadoI2C estado_i2c = I2C_LIVRE;
+volatile EventoI2C evento_i2c = EV_NENHUM;
+
+uint8_t rx_char;                    /* último caractere digitado no terminal */
+char    linha[TAM_LINHA];           /* linha sendo montada */
+uint8_t idx_linha = 0;
+char    comando[TAM_LINHA];         /* comando completo, pronto para tratar */
+volatile uint8_t comando_pronto = 0;
+
+uint8_t ctrl_tx;                    /* byte de controle enviado ao PCF8591 */
+uint8_t dac_tx[2];                  /* {controle, valor} para o DAC */
+uint8_t adc_rx[2];                  /* 2 bytes lidos do PCF8591 */
+uint8_t canal_atual = 0;            /* canal da leitura em andamento */
+uint8_t dac_valor = 0;              /* último valor enviado ao DAC */
+uint8_t dac_ligado = 0;             /* 1 depois do primeiro Set_DAC */
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_I2C1_Init(void);
+/* USER CODE BEGIN PFP */
+static void uart_print(const char *s);
+static void tratar_evento_i2c(void);
+static void processar_comando(const char *cmd);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_I2C1_Init();
+  /* USER CODE BEGIN 2 */
+  uart_print("\r\n=== Projeto 4: Nucleo + PCF8591 (I2C) ===\r\n");
+  uart_print("Comandos: Read_AIN0 | Read_AIN1 | Read_AIN3 | Set_DAC_<0-255>\r\n");
+  HAL_UART_Receive_IT(&huart2, &rx_char, 1);   /* começa a ouvir o terminal */
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+	    if (evento_i2c != EV_NENHUM) {
+	      tratar_evento_i2c();
+	    }
+	    if (comando_pronto && estado_i2c == I2C_LIVRE) {
+	      comando_pronto = 0;
+	      processar_comando(comando);
+	    }
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 1;
+  RCC_OscInitStruct.PLL.PLLN = 10;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x10D19CE4;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LD2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+/* ---------- funções de apoio ---------- */
+
+static void uart_print(const char *s)
+{
+  HAL_UART_Transmit(&huart2, (uint8_t *)s, (uint16_t)strlen(s), 100);
+}
+
+/* converte o valor 0-255 em volts (texto), usando 3,3 V / 256 por degrau */
+static void formata_volts(char *dest, size_t n, uint8_t valor)
+{
+  uint32_t mv = (uint32_t)valor * 3300u / 256u;
+  snprintf(dest, n, "%lu.%02lu V", (unsigned long)(mv / 1000u), (unsigned long)((mv % 1000u) / 10u));
+}
+
+/* ---------- início das operações I2C (todas não bloqueantes) ---------- */
+
+static void iniciar_leitura(uint8_t canal)
+{
+  canal_atual = canal;
+  ctrl_tx = (dac_ligado ? CTRL_DAC_ON : 0x00) | canal;   /* mantém o DAC ligado, se já estava */
+  estado_i2c = I2C_ENVIANDO_CANAL;
+  if (HAL_I2C_Master_Transmit_IT(&hi2c1, PCF8591_ADDR, &ctrl_tx, 1) != HAL_OK) {
+    estado_i2c = I2C_LIVRE;
+    evento_i2c = EV_ERRO;
+  }
+}
+
+static void iniciar_dac(uint8_t valor)
+{
+  dac_valor = valor;
+  dac_tx[0] = CTRL_DAC_ON;     /* byte de controle: saída analógica ligada */
+  dac_tx[1] = valor;           /* byte de dados: valor do DAC */
+  estado_i2c = I2C_ENVIANDO_DAC;
+  if (HAL_I2C_Master_Transmit_IT(&hi2c1, PCF8591_ADDR, dac_tx, 2) != HAL_OK) {
+    estado_i2c = I2C_LIVRE;
+    evento_i2c = EV_ERRO;
+  }
+}
+
+/* ---------- interpreta o texto digitado no terminal ---------- */
+
+static void processar_comando(const char *cmd)
+{
+  if (strcmp(cmd, "Read_AIN0") == 0) {
+    iniciar_leitura(0);
+  } else if (strcmp(cmd, "Read_AIN1") == 0) {
+    iniciar_leitura(1);
+  } else if (strcmp(cmd, "Read_AIN3") == 0) {
+    iniciar_leitura(3);
+  } else if (strcmp(cmd, "Read_AIN2") == 0) {
+    uart_print("AIN2 sem uso na placa PCF8591\r\n");
+  } else if (strncmp(cmd, "Set_DAC_", 8) == 0) {
+    const char *p = cmd + 8;
+    size_t n = strlen(p);
+    int ok = (n > 0 && n <= 3);
+    for (size_t i = 0; i < n && ok; i++) {
+      if (!isdigit((unsigned char)p[i])) ok = 0;
+    }
+    int v = ok ? atoi(p) : -1;
+    if (ok && v >= 0 && v <= 255) {
+      iniciar_dac((uint8_t)v);
+    } else {
+      uart_print("Valor invalido. Use Set_DAC_<0 a 255>\r\n");
+    }
+  } else {
+    uart_print("Comando invalido. Use: Read_AIN0, Read_AIN1, Read_AIN3, Set_DAC_<0-255>\r\n");
+  }
+}
+
+/* ---------- reage aos eventos gerados pelos callbacks ---------- */
+
+static void tratar_evento_i2c(void)
+{
+  char msg[80];
+  char volts[16];
+  EventoI2C ev = evento_i2c;
+  evento_i2c = EV_NENHUM;
+
+  switch (ev) {
+  case EV_CANAL_ENVIADO:
+    /* canal escolhido: agora lê 2 bytes (o 1º é a conversão anterior, o 2º é a atual) */
+    estado_i2c = I2C_LENDO;
+    if (HAL_I2C_Master_Receive_IT(&hi2c1, PCF8591_ADDR, adc_rx, 2) != HAL_OK) {
+      estado_i2c = I2C_LIVRE;
+      uart_print("Erro I2C ao iniciar a leitura\r\n");
+    }
+    break;
+
+  case EV_LEITURA_OK:
+    formata_volts(volts, sizeof(volts), adc_rx[1]);
+    snprintf(msg, sizeof(msg), "AIN%u: %u (%s)\r\n", (unsigned)canal_atual, (unsigned)adc_rx[1], volts);
+    uart_print(msg);
+    break;
+
+  case EV_DAC_OK:
+    dac_ligado = 1;
+    formata_volts(volts, sizeof(volts), dac_valor);
+    snprintf(msg, sizeof(msg), "Valor do DAC: %u (%s)\r\n", (unsigned)dac_valor, volts);
+    uart_print(msg);
+    break;
+
+  case EV_ERRO:
+  default:
+    snprintf(msg, sizeof(msg), "Erro I2C (codigo 0x%02lX). Confira fios e alimentacao.\r\n", (unsigned long)hi2c1.ErrorCode);
+    uart_print(msg);
+    break;
+  }
+}
+
+/* ---------- callbacks (chamados pelo HAL quando algo termina) ---------- */
+
+void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C1) {
+    if (estado_i2c == I2C_ENVIANDO_CANAL) {
+      evento_i2c = EV_CANAL_ENVIADO;
+    } else if (estado_i2c == I2C_ENVIANDO_DAC) {
+      estado_i2c = I2C_LIVRE;
+      evento_i2c = EV_DAC_OK;
+    }
+  }
+}
+
+void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C1 && estado_i2c == I2C_LENDO) {
+    estado_i2c = I2C_LIVRE;
+    evento_i2c = EV_LEITURA_OK;
+  }
+}
+
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C1) {
+    estado_i2c = I2C_LIVRE;
+    evento_i2c = EV_ERRO;
+  }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2) {
+    if (rx_char == '\r' || rx_char == '\n') {          /* ENTER: a linha terminou */
+      if (idx_linha > 0) {
+        linha[idx_linha] = '\0';
+        memcpy(comando, linha, idx_linha + 1);
+        comando_pronto = 1;
+        idx_linha = 0;
+      }
+    } else if (idx_linha < TAM_LINHA - 1) {
+      linha[idx_linha++] = (char)rx_char;
+    }
+    HAL_UART_Receive_IT(&huart2, &rx_char, 1);         /* continua ouvindo */
+  }
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
