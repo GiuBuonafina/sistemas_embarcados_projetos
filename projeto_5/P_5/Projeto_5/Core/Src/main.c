@@ -1,0 +1,750 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef enum { I2C_LIVRE, I2C_ENVIANDO_CANAL, I2C_LENDO, I2C_ENVIANDO_DAC } EstadoI2C;
+typedef enum { EV_NENHUM, EV_CANAL_ENVIADO, EV_LEITURA_OK, EV_DAC_OK, EV_ERRO } EventoI2C;
+typedef enum { ORIG_AIN, ORIG_TEMP, ORIG_VOLT, ORIG_LDR } Origem;
+typedef struct { uint8_t reg; uint8_t dado; } PacoteSPI;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define HUART_PC          huart2        /* UART ligada ao PC: USART2 (cabo USB do ST-LINK) */
+#define PCF8591_ADDR      (0x48 << 1)   /* endereco 0x48 no formato do HAL = 0x90 */
+#define CTRL_DAC_ON       0x40          /* bit 6 do byte de controle: liga a saida analogica */
+#define TAM_LINHA         32
+#define LIMIAR            128           /* < 128 -> '-'   >= 128 -> '+' */
+#define PERIODO_PISCA_MS  500
+
+/* registradores do MAX7219 */
+#define MAX_REG_DECODE    0x09
+#define MAX_REG_INTENS    0x0A
+#define MAX_REG_SCAN      0x0B
+#define MAX_REG_SHUTDOWN  0x0C
+#define MAX_REG_TEST      0x0F
+#define FILA_SPI          32
+
+/* orientacao da matriz: se as letras aparecerem deitadas / espelhadas / de cabeca para baixo,
+   troque estes valores (0 ou 1) ate ficarem certas */
+#define MATRIZ_GIRAR      0
+#define MATRIZ_INVERTER   0
+#define MATRIZ_ESPELHAR   0
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+SPI_HandleTypeDef hspi1;
+
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+/* ---- I2C / PCF8591 ---- */
+static volatile EstadoI2C estado_i2c = I2C_LIVRE;
+static volatile EventoI2C evento_i2c = EV_NENHUM;
+static volatile uint32_t  erro_i2c   = 0;
+static uint8_t  ctrl_tx;
+static uint8_t  dac_tx[2];
+static uint8_t  adc_rx[2];
+static uint8_t  canal_atual = 0;
+static Origem   origem      = ORIG_AIN;
+static uint8_t  dac_valor   = 0;
+static uint8_t  dac_ligado  = 0;
+
+/* ---- UART / comandos ---- */
+static uint8_t  rx_char;
+static char     linha[TAM_LINHA];
+static uint8_t  idx_linha = 0;
+static char     comando[TAM_LINHA];
+static volatile uint8_t comando_pronto = 0;
+
+/* ---- SPI / MAX7219 ---- */
+static PacoteSPI fila_spi[FILA_SPI];
+static uint8_t   fila_ini = 0, fila_fim = 0, fila_qtd = 0;
+static uint8_t   spi_tx[2];
+static volatile uint8_t spi_ocupado = 0;
+
+/* ---- matriz ---- */
+static char      matriz_modo  = 0;     /* 0 = nada;  'T', 'V' ou 'L' */
+static char      matriz_sinal = '-';   /* '+' ou '-' */
+static uint8_t   matriz_fase  = 0;     /* 0 = mostra a letra, 1 = mostra o sinal */
+static uint32_t  matriz_t0    = 0;
+
+/* desenhos 8x8: cada byte e uma linha (de cima para baixo); bit 7 = coluna da esquerda */
+static const uint8_t G_T[8]     = {0x7E,0x7E,0x18,0x18,0x18,0x18,0x18,0x18};
+static const uint8_t G_V[8]     = {0x42,0x42,0x42,0x42,0x42,0x24,0x24,0x18};
+static const uint8_t G_L[8]     = {0x60,0x60,0x60,0x60,0x60,0x60,0x7E,0x7E};
+static const uint8_t G_MAIS[8]  = {0x00,0x18,0x18,0x7E,0x7E,0x18,0x18,0x00};
+static const uint8_t G_MENOS[8] = {0x00,0x00,0x00,0x7E,0x7E,0x00,0x00,0x00};
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_SPI1_Init(void);
+/* USER CODE BEGIN PFP */
+static void uart_print(const char *s);
+static void formata_volts(uint8_t valor, char *dst, size_t n);
+static void Read_PCF8591(uint8_t canal, Origem o);
+static void iniciar_dac(uint8_t valor);
+static void Process_Command(const char *cmd);
+static void tratar_evento_i2c(void);
+static void concluir_leitura(uint8_t valor);
+static void max_escrever(uint8_t reg, uint8_t dado);
+static void max_init(void);
+static void spi_bombear(void);
+static void desenhar(const uint8_t g[8]);
+static void matriz_mostrar(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_I2C1_Init();
+  MX_SPI1_Init();
+  /* USER CODE BEGIN 2 */
+  uart_print("\r\nProjeto SPI + I2C: Temp, Volt, LDR, Read_AIN0/1/3, Set_DAC_<0-255>\r\n");
+  HAL_UART_Receive_IT(&HUART_PC, &rx_char, 1);   /* comeca a ouvir o teclado */
+  max_init();                                     /* coloca a configuracao do MAX7219 na fila SPI */
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+	  /* 1) algum aviso do I2C para tratar? */
+	  if (evento_i2c != EV_NENHUM) {
+	      tratar_evento_i2c();
+	  }
+
+	  /* 2) comando novo e I2C livre? */
+	  if (comando_pronto && estado_i2c == I2C_LIVRE) {
+	      comando_pronto = 0;
+	      Process_Command(comando);
+	  }
+
+	  /* 3) manda o proximo pacote da fila para o MAX7219 (se o SPI estiver livre) */
+	  spi_bombear();
+
+	  /* 4) alterna letra / sinal a cada 500 ms, sem travar nada */
+	  if (matriz_modo != 0 && (HAL_GetTick() - matriz_t0) >= PERIODO_PISCA_MS) {
+	      matriz_t0 = HAL_GetTick();
+	      matriz_fase ^= 1;
+	      matriz_mostrar();
+	  }
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 1;
+  RCC_OscInitStruct.PLL.PLLN = 10;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x10D19CE4;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(MAX_CS_GPIO_Port, MAX_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : MAX_CS_Pin */
+  GPIO_InitStruct.Pin = MAX_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(MAX_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+/* ================= UART: texto para o PC ================= */
+static void uart_print(const char *s)
+{
+    HAL_UART_Transmit(&HUART_PC, (uint8_t *)s, (uint16_t)strlen(s), 100);
+}
+
+/* valor 0-255 -> "x.xx V" (valor * 3,3 V / 256) */
+static void formata_volts(uint8_t valor, char *dst, size_t n)
+{
+    unsigned mv = ((unsigned)valor * 3300u) / 256u;
+    snprintf(dst, n, "%u.%02u V", mv / 1000u, (mv % 1000u) / 10u);
+}
+
+/* ================= funcoes de texto (comandos) ================= */
+static int iguais(const char *a, const char *b)            /* compara sem diferenciar maiuscula */
+{
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++; b++;
+    }
+    return (*a == 0 && *b == 0);
+}
+
+static int comeca_com(const char *s, const char *prefixo)
+{
+    while (*prefixo) {
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*prefixo)) return 0;
+        s++; prefixo++;
+    }
+    return 1;
+}
+
+static int le_numero(const char *s, unsigned *out)         /* so digitos, 1 a 3 */
+{
+    unsigned v = 0; int n = 0;
+    while (*s >= '0' && *s <= '9') { v = v * 10u + (unsigned)(*s - '0'); s++; n++; if (n > 3) return 0; }
+    if (n == 0 || *s != 0) return 0;
+    *out = v;
+    return 1;
+}
+
+/* ================= I2C / PCF8591 (sem bloquear) ================= */
+static void Read_PCF8591(uint8_t canal, Origem o)
+{
+    canal_atual = canal;
+    origem      = o;
+    ctrl_tx     = (uint8_t)((dac_ligado ? CTRL_DAC_ON : 0) | canal);   /* escolhe o canal */
+    estado_i2c  = I2C_ENVIANDO_CANAL;
+    if (HAL_I2C_Master_Transmit_IT(&hi2c1, PCF8591_ADDR, &ctrl_tx, 1) != HAL_OK) {
+        estado_i2c = I2C_LIVRE;
+        uart_print("Erro: I2C ocupado\r\n");
+    }
+}
+
+static void iniciar_dac(uint8_t valor)
+{
+    dac_tx[0]  = CTRL_DAC_ON;     /* byte de controle: DAC ligado */
+    dac_tx[1]  = valor;           /* valor 0-255 */
+    estado_i2c = I2C_ENVIANDO_DAC;
+    if (HAL_I2C_Master_Transmit_IT(&hi2c1, PCF8591_ADDR, dac_tx, 2) != HAL_OK) {
+        estado_i2c = I2C_LIVRE;
+        uart_print("Erro: I2C ocupado\r\n");
+    }
+}
+
+static void Process_Command(const char *cmd)
+{
+    unsigned v;
+    char msg[48];
+
+    if      (iguais(cmd, "Temp"))      Read_PCF8591(1, ORIG_TEMP);   /* NTC          */
+    else if (iguais(cmd, "Volt"))      Read_PCF8591(3, ORIG_VOLT);   /* potenciometro */
+    else if (iguais(cmd, "LDR"))       Read_PCF8591(0, ORIG_LDR);    /* luz          */
+    else if (iguais(cmd, "Read_AIN0")) Read_PCF8591(0, ORIG_AIN);
+    else if (iguais(cmd, "Read_AIN1")) Read_PCF8591(1, ORIG_AIN);
+    else if (iguais(cmd, "Read_AIN3")) Read_PCF8591(3, ORIG_AIN);
+    else if (iguais(cmd, "Read_AIN2")) uart_print("AIN2 sem uso na placa PCF8591\r\n");
+    else if (comeca_com(cmd, "Set_DAC_")) {
+        if (le_numero(cmd + 8, &v) && v <= 255u) {
+            dac_valor = (uint8_t)v;
+            iniciar_dac(dac_valor);
+        } else {
+            uart_print("Valor invalido: use Set_DAC_<0-255>\r\n");
+        }
+    } else {
+        snprintf(msg, sizeof msg, "Comando desconhecido: %s\r\n", cmd);
+        uart_print(msg);
+    }
+}
+
+/* chamada pelo laco principal quando um callback do I2C deixou um aviso */
+static void tratar_evento_i2c(void)
+{
+    EventoI2C ev = evento_i2c;
+    char msg[64], vb[16];
+    evento_i2c = EV_NENHUM;
+
+    switch (ev) {
+    case EV_CANAL_ENVIADO:                       /* canal escolhido: agora le 2 bytes */
+        estado_i2c = I2C_LENDO;
+        if (HAL_I2C_Master_Receive_IT(&hi2c1, PCF8591_ADDR, adc_rx, 2) != HAL_OK) {
+            estado_i2c = I2C_LIVRE;
+            uart_print("Erro: I2C ocupado\r\n");
+        }
+        break;
+
+    case EV_LEITURA_OK:                          /* adc_rx[0] = conversao anterior, adc_rx[1] = a nova */
+        estado_i2c = I2C_LIVRE;
+        concluir_leitura(adc_rx[1]);
+        break;
+
+    case EV_DAC_OK:
+        estado_i2c = I2C_LIVRE;
+        dac_ligado = 1;
+        formata_volts(dac_valor, vb, sizeof vb);
+        snprintf(msg, sizeof msg, "Valor do DAC: %u (%s)\r\n", dac_valor, vb);
+        uart_print(msg);
+        break;
+
+    case EV_ERRO:
+        estado_i2c = I2C_LIVRE;
+        snprintf(msg, sizeof msg, "Erro I2C (codigo 0x%02lX): verifique SDA, SCL e VCC\r\n", (unsigned long)erro_i2c);
+        uart_print(msg);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* mostra o valor no terminal e, se o comando foi Temp/Volt/LDR, atualiza a matriz */
+static void concluir_leitura(uint8_t valor)
+{
+    char msg[64], vb[16];
+    formata_volts(valor, vb, sizeof vb);
+
+    if (origem == ORIG_AIN) {
+        snprintf(msg, sizeof msg, "AIN%u: %u (%s)\r\n", canal_atual, valor, vb);
+        uart_print(msg);
+        return;
+    }
+
+    {
+        const char *nome  = (origem == ORIG_TEMP) ? "Temp" : (origem == ORIG_VOLT) ? "Volt" : "LDR";
+        char        letra = (origem == ORIG_TEMP) ? 'T'    : (origem == ORIG_VOLT) ? 'V'    : 'L';
+        char        sinal = (valor >= LIMIAR) ? '+' : '-';
+
+        snprintf(msg, sizeof msg, "%s: %u (%s) -> matriz: %c e %c\r\n", nome, valor, vb, letra, sinal);
+        uart_print(msg);
+
+        matriz_modo  = letra;
+        matriz_sinal = sinal;
+        matriz_fase  = 0;                 /* comeca mostrando a letra */
+        matriz_t0    = HAL_GetTick();
+        matriz_mostrar();
+    }
+}
+
+/* ================= SPI / MAX7219 (sem bloquear) ================= */
+/* poe um pacote (registrador + dado) na fila; quem envia de fato e o spi_bombear() */
+static void max_escrever(uint8_t reg, uint8_t dado)
+{
+    if (fila_qtd < FILA_SPI) {
+        fila_spi[fila_fim].reg  = reg;
+        fila_spi[fila_fim].dado = dado;
+        fila_fim = (uint8_t)((fila_fim + 1) % FILA_SPI);
+        fila_qtd++;
+    }
+}
+
+/* se o SPI esta livre e ha pacote na fila: CS baixo e Transmit_IT (o CS sobe no callback) */
+static void spi_bombear(void)
+{
+    if (spi_ocupado || fila_qtd == 0) return;
+
+    spi_tx[0] = fila_spi[fila_ini].reg;
+    spi_tx[1] = fila_spi[fila_ini].dado;
+    HAL_GPIO_WritePin(MAX_CS_GPIO_Port, MAX_CS_Pin, GPIO_PIN_RESET);
+    spi_ocupado = 1;
+
+    if (HAL_SPI_Transmit_IT(&hspi1, spi_tx, 2) == HAL_OK) {
+        fila_ini = (uint8_t)((fila_ini + 1) % FILA_SPI);   /* pacote saiu da fila */
+        fila_qtd--;
+    } else {                                                /* nao deu: tenta de novo depois */
+        HAL_GPIO_WritePin(MAX_CS_GPIO_Port, MAX_CS_Pin, GPIO_PIN_SET);
+        spi_ocupado = 0;
+    }
+}
+
+static void max_init(void)
+{
+    max_escrever(MAX_REG_TEST,     0x00);   /* sem teste (todos os LEDs acesos) */
+    max_escrever(MAX_REG_SHUTDOWN, 0x01);   /* sai do desligado: operacao normal */
+    max_escrever(MAX_REG_SCAN,     0x07);   /* varre as 8 linhas */
+    max_escrever(MAX_REG_DECODE,   0x00);   /* sem decodificador: controle bit a bit */
+    max_escrever(MAX_REG_INTENS,   0x03);   /* brilho baixo (0x00 a 0x0F) */
+    for (uint8_t r = 1; r <= 8; r++) {
+        max_escrever(r, 0x00);              /* apaga as 8 linhas */
+    }
+}
+
+static uint8_t inverter_bits(uint8_t b)
+{
+    b = (uint8_t)(((b & 0xF0) >> 4) | ((b & 0x0F) << 4));
+    b = (uint8_t)(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
+    b = (uint8_t)(((b & 0xAA) >> 1) | ((b & 0x55) << 1));
+    return b;
+}
+
+/* manda um desenho 8x8 para a matriz (8 pacotes: linha 1 a 8) */
+static void desenhar(const uint8_t g[8])
+{
+    uint8_t t[8], r[8];
+    int i, j;
+
+    for (i = 0; i < 8; i++) t[i] = g[i];
+
+    if (MATRIZ_GIRAR) {                         /* transpoe: linhas viram colunas */
+        for (i = 0; i < 8; i++) r[i] = 0;
+        for (i = 0; i < 8; i++)
+            for (j = 0; j < 8; j++)
+                if (t[i] & (0x80 >> j)) r[j] |= (uint8_t)(0x80 >> i);
+        for (i = 0; i < 8; i++) t[i] = r[i];
+    }
+    for (i = 0; i < 8; i++) {
+        uint8_t dado = MATRIZ_ESPELHAR ? inverter_bits(t[i]) : t[i];
+        uint8_t reg  = MATRIZ_INVERTER ? (uint8_t)(8 - i) : (uint8_t)(i + 1);
+        max_escrever(reg, dado);
+    }
+}
+
+/* mostra a letra (fase 0) ou o sinal (fase 1) */
+static void matriz_mostrar(void)
+{
+    if (matriz_fase == 0) {
+        desenhar(matriz_modo == 'T' ? G_T : (matriz_modo == 'V' ? G_V : G_L));
+    } else {
+        desenhar(matriz_sinal == '+' ? G_MAIS : G_MENOS);
+    }
+}
+
+/* ================= CALLBACKS (o HAL chama sozinho; ficam curtos) ================= */
+void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c->Instance != I2C1) return;
+    evento_i2c = (estado_i2c == I2C_ENVIANDO_DAC) ? EV_DAC_OK : EV_CANAL_ENVIADO;
+}
+
+void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c->Instance != I2C1) return;
+    evento_i2c = EV_LEITURA_OK;
+}
+
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c->Instance != I2C1) return;
+    erro_i2c   = HAL_I2C_GetError(hi2c);
+    evento_i2c = EV_ERRO;
+}
+
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance != SPI1) return;
+    HAL_GPIO_WritePin(MAX_CS_GPIO_Port, MAX_CS_Pin, GPIO_PIN_SET);   /* fecha o pacote */
+    spi_ocupado = 0;
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance != SPI1) return;
+    HAL_GPIO_WritePin(MAX_CS_GPIO_Port, MAX_CS_Pin, GPIO_PIN_SET);
+    spi_ocupado = 0;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == HUART_PC.Instance) {
+        if (rx_char == '\r' || rx_char == '\n') {
+            if (idx_linha > 0) {                      /* Enter: fecha o comando */
+                linha[idx_linha] = 0;
+                strcpy(comando, linha);
+                comando_pronto = 1;
+                idx_linha = 0;
+            }
+        } else if (idx_linha < TAM_LINHA - 1) {
+            linha[idx_linha++] = (char)rx_char;
+        }
+        HAL_UART_Receive_IT(&HUART_PC, &rx_char, 1);  /* rearma para o proximo caractere */
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == HUART_PC.Instance) {
+        HAL_UART_Receive_IT(&HUART_PC, &rx_char, 1);  /* se der erro (ruido), volta a ouvir */
+    }
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
